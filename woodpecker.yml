@@ -1,0 +1,174 @@
+variables:
+  - &ssh-settings
+    user: root
+    host: ssh.soltegra.io
+    port: 2222
+    key:
+      from_secret: ssh_key_your_server  # Verweis auf das hinterlegte Secret
+
+steps:
+  - name: setup-environment
+    image: alpine:latest
+    commands:
+      - echo "Setting up environment..."
+      - apk add --no-cache bash
+      - apk add --no-cache nodejs npm openssh-client sshpass rsync
+      - echo "Sourcing common.sh from its actual location..."
+      - source /woodpecker/src/gitea.soltegra.io/Soltegra/OpenEMS/tools/common.sh
+      - common_initialize_environment
+
+  - name: build-angular
+    image: node:20
+    commands:
+      - echo "Building Angular project..."
+      - cd ui
+      - npm install
+      - npx ng lint
+      - npx ng build -c "openems,openems-backend-prod,prod" --output-path=www
+    depends_on: [setup-environment]
+
+  - name: build-openems-backend
+    image: openems-bash:latest
+    environment:
+      SSH_USER: root
+      SSH_PASSWORD: 
+        from_secret: ssh_dev  # Use SSH password instead of key
+      GRADLE_USER_HOME: /tmp/gradle-cache
+    commands:
+      - echo "Building OpenEMS Backend..."
+      - chmod +x ./gradlew
+      - source /tools/common.sh
+      - common_initialize_environment
+      - common_build_backend
+    depends_on: [setup-environment]
+
+  - name: build-openems-edge
+    image: openems-bash:latest
+    environment:
+      SSH_USER: root
+      SSH_PASSWORD: 
+        from_secret: ssh_dev
+      GRADLE_USER_HOME: /tmp/gradle-cache
+    commands:
+      - echo "Building OpenEMS Edge..."
+      - chmod +x ./gradlew
+      - source /tools/common.sh
+      - common_initialize_environment
+      - common_build_edge
+      - echo "Installing sshpass..."
+      - apt-get update && apt-get install -y sshpass
+      - echo "Copying Edge and Backend .jar to server..."
+      - sshpass -p "$SSH_PASSWORD" scp -P 22 -o StrictHostKeyChecking=no ./build/openems-backend.jar $SSH_USER@142.132.201.220:/usr/share/sems/main/backend.jar
+      - sshpass -p "$SSH_PASSWORD" scp -P 22 -o StrictHostKeyChecking=no ./build/openems-edge.jar $SSH_USER@142.132.201.220:/usr/share/sems/main/edge.jar
+    depends_on: [build-openems-backend]
+
+  - name: build-deb
+    image: openems-bash:latest
+    environment:
+      SSH_USER: root
+      SSH_PASSWORD: 
+        from_secret: ssh_dev
+      GRADLE_USER_HOME: /tmp/gradle-cache
+    commands:
+      - echo "Building OpenEMS Edge..."
+      - chmod +x ./gradlew
+      - echo "Setting up compatible Node.js and npm..."
+      - curl -fsSL https://deb.nodesource.com/setup_20.x | bash -  # Node.js 20 setup
+      - apt-get install -y nodejs  # Installs compatible Node.js and npm versions
+      - node -v  # Verify Node.js version
+      - npm -v   # Verify npm version
+      - echo "Running build-debian-package.sh..."
+      - chmod +x ./tools/build-debian-package.sh
+      - ./tools/build-debian-package.sh
+      - echo "Installing sshpass..."
+      - apt-get update && apt-get install -y sshpass
+      - echo "Copying Edge and Backend .jar to server..."
+      - sshpass -p "$SSH_PASSWORD" scp -P 22 -o StrictHostKeyChecking=no ./tools/sems.deb $SSH_USER@142.132.201.220:/usr/share/sems/main/sems.deb
+      - sshpass -p "$SSH_PASSWORD" scp -P 22 -o StrictHostKeyChecking=no ./tools/sems-latest.version $SSH_USER@142.132.201.220:/usr/share/sems/main/sems-latest.version      
+    depends_on: [build-openems-edge]
+
+  - name: sync-capacitor
+    image: node:20
+    commands:
+      - echo "Syncing Capacitor changes to Android project..."
+      - cd ui
+      - npx cap sync
+    depends_on: [build-angular]
+
+  - name: build-apk
+    image: mingc/android-build-box:latest
+    environment:
+      GRADLE_USER_HOME: /tmp/gradle
+    commands:
+      - echo "Building APK (Release version)..."
+      - cd ui/android
+      - ./gradlew assembleRelease --no-daemon
+    depends_on: [sync-capacitor]
+
+  - name: build-aab
+    image: mingc/android-build-box:latest
+    environment:
+      GRADLE_USER_HOME: /tmp/gradle
+    commands:
+      - echo "Building AAB (Release version)..."
+      - cd ui/android
+      - ./gradlew bundleRelease --no-daemon
+    depends_on: [build-apk]
+
+  - name: push-apk
+    image: alpine:latest
+    environment:
+      SSH_KEY: 
+        from_secret: ssh_key_your_server
+    commands:
+      - echo "Installing scp..."
+      - apk add --no-cache openssh-client
+      - mkdir -p ~/.ssh
+      - echo "$SSH_KEY" > ~/.ssh/id_rsa
+      - chmod 600 ~/.ssh/id_rsa
+      - ssh-keyscan -H -p 2222 ssh.soltegra.io >> ~/.ssh/known_hosts
+      - echo "Copying APK to server..."
+      - scp -P 2222 ui/android/app/build/outputs/apk/release/app-release.apk root@ssh.soltegra.io:/var/www/android_app/sems.apk
+    depends_on: [build-apk]
+
+  - name: clean-and-push-ui
+    image: alpine:latest
+    environment:
+      SSH_KEY:
+        from_secret: ssh_key_your_server
+      SSH_USER: root
+    commands:
+      - echo "Cleaning up and pushing UI files to server..."
+      # Install necessary tools once
+      - apk add --no-cache openssh-client rsync
+      # Prepare SSH key and permissions
+      - mkdir -p ~/.ssh
+      - echo "$SSH_KEY" > ~/.ssh/id_rsa
+      - chmod 600 ~/.ssh/id_rsa
+      - ssh-keyscan -H -p 2222 ssh.soltegra.io >> ~/.ssh/known_hosts
+      # Execute cleanup and rsync in sequence
+      - echo "Cleaning UI files on server..."
+      - ssh -i ~/.ssh/id_rsa -p 2222 -o StrictHostKeyChecking=no $SSH_USER@ssh.soltegra.io 'find /usr/share/openems/www -type f -not -path "/usr/share/openems/www/assets/*" -not -path "/usr/share/openems/www/svg/*" -delete'
+      - echo "Pushing UI files to server..."
+      - rsync -av --delete --exclude='assets/' --exclude='svg/' -e 'ssh -p 2222' ui/www/ $SSH_USER@ssh.soltegra.io:/usr/share/openems/www/
+    depends_on: [build-angular]
+
+  - name: push-apk-and-aab-to-host
+    image: alpine:latest
+    environment:
+      SSH_USER: root
+      SSH_PASSWORD: 
+        from_secret: ssh_dev
+    commands:
+      - echo "Installing scp and sshpass..."
+      - apk add --no-cache openssh-client sshpass
+      - echo "Copying APK and AAB to server..."
+      - sshpass -p "$SSH_PASSWORD" scp -o StrictHostKeyChecking=no ui/android/app/build/outputs/apk/release/app-release.apk $SSH_USER@142.132.201.220:/usr/share/sems/main-ui/sems.apk
+      - sshpass -p "$SSH_PASSWORD" scp -o StrictHostKeyChecking=no ui/android/app/build/outputs/bundle/release/app-release.aab $SSH_USER@142.132.201.220:/usr/share/sems/main-ui/sems.aab
+    depends_on: [build-apk, build-aab]
+
+when:
+  branch:
+    - main
+  event:
+    - push
